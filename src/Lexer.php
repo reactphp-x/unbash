@@ -649,6 +649,22 @@ final class Lexer
                 $i++;
                 continue;
             }
+            // Skip nested command substitutions so their inner delimiters don't close us.
+            if ($c === 36 && $this->cc($i + 1) === 40) { // $(
+                $i = $this->matchOneParen($i + 1) + 1;
+                continue;
+            }
+            if ($c === 96) { // `...`
+                $i++;
+                while ($i < $this->end && $this->cc($i) !== 96) {
+                    if ($this->cc($i) === 92) {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
             if ($c === $open) {
                 $depth++;
                 $i++;
@@ -962,7 +978,12 @@ final class Lexer
         }
 
         // ${#name} length, ${!name} indirect.
-        if ($inner[0] === '#' && $n > 1) {
+        // `#` is length only when a parameter follows; otherwise `#` is itself the
+        // (special) parameter, e.g. ${##} is param '#' with a '#' strip operator.
+        $afterHash = $n > 1 ? ord($inner[1]) : -1;
+        if ($inner[0] === '#' && $n > 1
+            && ($this->isNameStart($afterHash) || $this->isDigit($afterHash)
+                || $afterHash === 64 /* @ */ || $afterHash === 42 /* * */)) {
             $props['length'] = true;
             $k = 1;
         } elseif ($inner[0] === '!' && $n > 1) {
@@ -991,9 +1012,48 @@ final class Lexer
             $idxStart = $k + 1;
             $j = $idxStart;
             while ($j < $n) {
-                if ($inner[$j] === '[') {
+                $ch = $inner[$j];
+                if ($ch === '\\') {
+                    $j += 2;
+                    continue;
+                }
+                if ($ch === "'") {
+                    $j++;
+                    while ($j < $n && $inner[$j] !== "'") {
+                        $j++;
+                    }
+                    $j++;
+                    continue;
+                }
+                if ($ch === '"') {
+                    $j++;
+                    while ($j < $n && $inner[$j] !== '"') {
+                        if ($inner[$j] === '\\') {
+                            $j++;
+                        }
+                        $j++;
+                    }
+                    $j++;
+                    continue;
+                }
+                if ($ch === '`') {
+                    $j++;
+                    while ($j < $n && $inner[$j] !== '`') {
+                        if ($inner[$j] === '\\') {
+                            $j++;
+                        }
+                        $j++;
+                    }
+                    $j++;
+                    continue;
+                }
+                if ($ch === '$' && ($inner[$j + 1] ?? '') === '(') {
+                    $j = $this->skipParenInString($inner, $j + 1);
+                    continue;
+                }
+                if ($ch === '[') {
                     $depth++;
-                } elseif ($inner[$j] === ']') {
+                } elseif ($ch === ']') {
                     if ($depth === 0) {
                         break;
                     }
@@ -1038,8 +1098,8 @@ final class Lexer
             }
             $props['operator'] = substr($rest, 0, $patStart);
             $props['replace'] = [
-                'pattern' => $this->makeWord($pattern, $restStart + $patStart),
-                'replacement' => $this->makeWord($replacement, $restStart + $repStart),
+                'pattern' => $this->makeWord($pattern, $restStart + $patStart, true),
+                'replacement' => $this->makeWord($replacement, $restStart + $repStart, true),
             ];
 
             return;
@@ -1056,11 +1116,11 @@ final class Lexer
             } else {
                 $offset = substr($body, 0, $colon);
                 $length = substr($body, $colon + 1);
-                $lenWord = $this->makeWord($length, $restStart + 1 + $colon + 1);
+                $lenWord = $this->makeWord($length, $restStart + 1 + $colon + 1, true);
             }
             $props['operator'] = ':';
             $props['slice'] = [
-                'offset' => $this->makeWord($offset, $restStart + 1),
+                'offset' => $this->makeWord($offset, $restStart + 1, true),
                 'length' => $lenWord,
             ];
 
@@ -1082,21 +1142,96 @@ final class Lexer
         if ($matched !== null) {
             $props['operator'] = $matched;
             $operandStr = substr($rest, strlen($matched));
-            $props['operand'] = $this->makeWord($operandStr, $restStart + strlen($matched));
+            $props['operand'] = $this->makeWord($operandStr, $restStart + strlen($matched), true);
         }
+    }
+
+    /** Index just past the ')' matching the '(' at $from within string $s (quote-aware). */
+    private function skipParenInString(string $s, int $from): int
+    {
+        $i = $from;
+        $n = strlen($s);
+        $depth = 0;
+        while ($i < $n) {
+            $c = $s[$i];
+            if ($c === '\\') {
+                $i += 2;
+                continue;
+            }
+            if ($c === "'") {
+                $i++;
+                while ($i < $n && $s[$i] !== "'") {
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '"') {
+                $i++;
+                while ($i < $n && $s[$i] !== '"') {
+                    if ($s[$i] === '\\') {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '(') {
+                $depth++;
+            } elseif ($c === ')') {
+                $depth--;
+                if ($depth === 0) {
+                    return $i + 1;
+                }
+            }
+            $i++;
+        }
+
+        return $i;
     }
 
     private function topLevelColon(string $s): int
     {
         $depth = 0;
-        for ($i = 0, $n = strlen($s); $i < $n; $i++) {
+        $ternary = 0;
+        $n = strlen($s);
+        for ($i = 0; $i < $n; $i++) {
             $c = $s[$i];
+            if ($c === '\\') {
+                $i++;
+                continue;
+            }
+            if ($c === "'") {
+                $i++;
+                while ($i < $n && $s[$i] !== "'") {
+                    $i++;
+                }
+                continue;
+            }
+            if ($c === '"') {
+                $i++;
+                while ($i < $n && $s[$i] !== '"') {
+                    if ($s[$i] === '\\') {
+                        $i++;
+                    }
+                    $i++;
+                }
+                continue;
+            }
             if ($c === '(' || $c === '[' || $c === '{') {
                 $depth++;
             } elseif ($c === ')' || $c === ']' || $c === '}') {
                 $depth--;
+            } elseif ($c === '?' && $depth === 0) {
+                $ternary++;
             } elseif ($c === ':' && $depth === 0) {
-                return $i;
+                // A ':' that pairs with an earlier '?' belongs to a ternary, not the slice.
+                if ($ternary > 0) {
+                    $ternary--;
+                } else {
+                    return $i;
+                }
             }
         }
 
@@ -1246,11 +1381,11 @@ final class Lexer
         return $parts;
     }
 
-    private function makeWord(string $text, int $absStart): Word
+    private function makeWord(string $text, int $absStart, bool $embedded = false): Word
     {
         $sub = new self($this->source, $absStart, $absStart + strlen($text));
         $sub->nestingDepth = $this->nestingDepth;
-        [$end, $parts, $value] = $sub->scanWord($absStart);
+        [$end, $parts, $value] = $sub->scanWord($absStart, $embedded);
         foreach ($sub->deferred as $d) {
             $this->deferred[] = $d;
         }
