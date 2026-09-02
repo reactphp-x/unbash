@@ -64,7 +64,7 @@ final class Parser
 
         $script = new Node('Script', [
             'pos' => $this->start,
-            'end' => $this->lastEnd,
+            'end' => $this->end,
             'shebang' => $shebang,
             'commands' => $commands,
         ]);
@@ -272,7 +272,7 @@ final class Parser
             $end = $t['end'];
             $this->advance();
         } elseif ($this->isOp($t, ';')) {
-            $end = $t['end'];
+            // A trailing ';' terminates but is not part of the statement span.
             $this->advance();
         }
 
