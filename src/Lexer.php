@@ -1110,12 +1110,15 @@ final class Lexer
     {
         $operator = $this->source[$i];
         $start = $i;
-        [$close] = $this->matchBalanced($i + 2, 40, 41);
+        [$close, $found] = $this->matchBalanced($i + 2, 40, 41);
+        if (!$found) {
+            $this->addError('unterminated extended glob', $start);
+        }
         $patStart = $i + 2;
-        $patEnd = $close > $patStart ? $close - 1 : $close;
+        $patEnd = $found ? $close - 1 : $close;
         $pattern = $this->slice($patStart, $patEnd);
         $text = $this->slice($start, $close);
-        $parts = $this->partsOf($pattern, $patStart);
+        $parts = $this->partsOf($pattern, $patStart, true);
 
         return [$close, new Node('ExtendedGlob', [
             'text' => $text,
