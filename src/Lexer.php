@@ -389,7 +389,7 @@ final class Lexer
                 }
                 if ($nx === 123) { // ${
                     $flushLiteral($i);
-                    [$ni, $part] = $this->scanParameterExpansion($i);
+                    [$ni, $part] = $this->scanDollarBrace($i);
                     $parts[] = $part;
                     $hasStructure = true;
                     $litStart = $ni;
@@ -398,11 +398,7 @@ final class Lexer
                 }
                 if ($nx === 40) { // $(
                     $flushLiteral($i);
-                    if ($this->cc($i + 2) === 40) { // $((
-                        [$ni, $part] = $this->scanArithmeticExpansion($i);
-                    } else {
-                        [$ni, $part] = $this->scanCommandExpansion($i);
-                    }
+                    [$ni, $part] = $this->scanDollarParen($i);
                     $parts[] = $part;
                     $hasStructure = true;
                     $litStart = $ni;
@@ -550,7 +546,7 @@ final class Lexer
                 $nx = $this->cc($i + 1);
                 if ($nx === 123) {
                     $flush($i);
-                    [$ni, $part] = $this->scanParameterExpansion($i);
+                    [$ni, $part] = $this->scanDollarBrace($i);
                     $parts[] = $part;
                     $litStart = $ni;
                     $i = $ni;
@@ -558,11 +554,7 @@ final class Lexer
                 }
                 if ($nx === 40) {
                     $flush($i);
-                    if ($this->cc($i + 2) === 40) {
-                        [$ni, $part] = $this->scanArithmeticExpansion($i);
-                    } else {
-                        [$ni, $part] = $this->scanCommandExpansion($i);
-                    }
+                    [$ni, $part] = $this->scanDollarParen($i);
                     $parts[] = $part;
                     $litStart = $ni;
                     $i = $ni;
@@ -674,6 +666,109 @@ final class Lexer
         }
 
         return [$i, false];
+    }
+
+    /**
+     * Decide `$(( ))` arithmetic vs `$( (...) )` command substitution and scan it.
+     *
+     * @return array{0:int,1:Node}
+     */
+    private function scanDollarParen(int $i): array
+    {
+        if ($this->cc($i + 2) === 40 && $this->innerParenClosesArith($i + 2)) {
+            return $this->scanArithmeticExpansion($i);
+        }
+
+        return $this->scanCommandExpansion($i);
+    }
+
+    /**
+     * Decide `${ }`/`${| }` command funsub vs `${...}` parameter expansion and scan it.
+     *
+     * @return array{0:int,1:Node}
+     */
+    private function scanDollarBrace(int $i): array
+    {
+        $c2 = $this->cc($i + 2);
+        if ($c2 === 32 || $c2 === 9 || $c2 === 10 || $c2 === 124 /* | */) {
+            return $this->scanBraceFunsub($i);
+        }
+
+        return $this->scanParameterExpansion($i);
+    }
+
+    /** True when the `(` at $from closes immediately before another `)` (so `$((...))` is arithmetic). */
+    private function innerParenClosesArith(int $from): bool
+    {
+        $m = $this->matchOneParen($from);
+
+        return $m + 1 < $this->end && $this->cc($m + 1) === 41;
+    }
+
+    private function matchOneParen(int $from): int
+    {
+        $i = $from;
+        $depth = 0;
+        while ($i < $this->end) {
+            $c = $this->cc($i);
+            if ($c === 92) {
+                $i += 2;
+                continue;
+            }
+            if ($c === 39) {
+                $i++;
+                while ($i < $this->end && $this->cc($i) !== 39) {
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === 34) {
+                $i++;
+                while ($i < $this->end && $this->cc($i) !== 34) {
+                    if ($this->cc($i) === 92) {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === 40) {
+                $depth++;
+            } elseif ($c === 41) {
+                $depth--;
+                if ($depth === 0) {
+                    return $i;
+                }
+            }
+            $i++;
+        }
+
+        return $i;
+    }
+
+    /** Bash 5.3 command funsub: `${ cmd; }` or `${| cmd; }`. @return array{0:int,1:Node} */
+    private function scanBraceFunsub(int $i): array
+    {
+        $start = $i;
+        $bodyStart = $this->cc($i + 2) === 124 ? $i + 3 : $i + 2;
+        [$close, $found] = $this->matchBalanced($i + 2, 123, 125);
+        if (!$found) {
+            $this->addError('unterminated command substitution', $start);
+        }
+        $innerEnd = $found ? $close - 1 : $close;
+        $inner = $this->slice($bodyStart, $innerEnd);
+        $text = $this->slice($start, $close);
+        $part = new Node('CommandExpansion', [
+            'text' => $text,
+            'script' => null,
+            'inner' => $inner,
+            'innerStart' => $bodyStart,
+        ]);
+        $this->deferred[] = ['part' => $part, 'depth' => $this->nestingDepth];
+
+        return [$close, $part];
     }
 
     /** @return array{0:int,1:Node} */
@@ -1453,7 +1548,7 @@ final class Lexer
                 $nx = $sub->cc($i + 1);
                 if ($nx === 123) {
                     $flush($i);
-                    [$ni, $part] = $sub->scanParameterExpansion($i);
+                    [$ni, $part] = $sub->scanDollarBrace($i);
                     $parts[] = $part;
                     $litStart = $ni;
                     $i = $ni;
@@ -1461,11 +1556,7 @@ final class Lexer
                 }
                 if ($nx === 40) {
                     $flush($i);
-                    if ($sub->cc($i + 2) === 40) {
-                        [$ni, $part] = $sub->scanArithmeticExpansion($i);
-                    } else {
-                        [$ni, $part] = $sub->scanCommandExpansion($i);
-                    }
+                    [$ni, $part] = $sub->scanDollarParen($i);
                     $parts[] = $part;
                     $litStart = $ni;
                     $i = $ni;
