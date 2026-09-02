@@ -1139,6 +1139,14 @@ final class Parser
                 ]);
             }
 
+            // Array-subscript assignment in prefix position: `name[expr]=value`,
+            // where the subscript is a matched pair (may contain spaces/operators).
+            if ($name === null && ($sub = $this->trySubscriptAssignment($t)) !== null) {
+                $prefix[] = $sub;
+                $end = $sub->end;
+                continue;
+            }
+
             // Assignment prefix (only before the command name).
             if ($name === null && ($asg = $this->tryAssignment($t)) !== null) {
                 $prefix[] = $asg;
@@ -1171,11 +1179,191 @@ final class Parser
     }
 
     /**
+     * Try to parse `name[subscript]=value` (or `+=`) at the current prefix position.
+     * The subscript is a matched `[ ]` pair that may contain spaces and operators.
+     *
+     * @param array{type: string, op?: string, word?: Word, pos: int, end: int} $t
+     */
+    private function trySubscriptAssignment(array $t): ?Node
+    {
+        if ($t['type'] !== 'word') {
+            return null;
+        }
+        $src = $this->lexer->source();
+        $pos = $t['pos'];
+        // Require a leading `name[` at this position.
+        if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*\[/', substr($src, $pos, $this->end - $pos))) {
+            return null;
+        }
+        $n = $pos;
+        while ($n < $this->end && ($this->isNameCharAt($src, $n))) {
+            $n++;
+        }
+        // $n is at '['
+        if ($n >= $this->end || $src[$n] !== '[') {
+            return null;
+        }
+        $indexStart = $n + 1;
+        $bracketEnd = $this->matchBracket($n); // index of matching ']'
+        if ($bracketEnd >= $this->end || $src[$bracketEnd] !== ']') {
+            return null; // unterminated subscript: not an assignment
+        }
+        $i = $bracketEnd + 1;
+        while ($i + 1 < $this->end && $src[$i] === '\\' && $src[$i + 1] === "\n") {
+            $i += 2;
+        }
+        $append = false;
+        if ($i < $this->end && $src[$i] === '+') {
+            $j = $i + 1;
+            while ($j + 1 < $this->end && $src[$j] === '\\' && $src[$j + 1] === "\n") {
+                $j += 2;
+            }
+            if ($j < $this->end && $src[$j] === '=') {
+                $append = true;
+                $i = $j;
+            } else {
+                return null;
+            }
+        }
+        if ($i >= $this->end || $src[$i] !== '=') {
+            return null; // no '=' → not an assignment
+        }
+
+        $name = substr($src, $pos, $n - $pos);
+        $index = substr($src, $indexStart, $bracketEnd - $indexStart);
+        $indexParts = $this->lexer->embeddedWordParts($indexStart, $bracketEnd);
+        $valueStart = $i + 1;
+
+        // Consume the value as a single word from the source.
+        $this->buf = [];
+        $this->lexer->seek($valueStart);
+        $valueEnd = $valueStart;
+        $value = null;
+        $vc = $valueStart < $this->end ? $src[$valueStart] : '';
+        $isValueTerminator = $vc === '' || $vc === ' ' || $vc === "\t" || $vc === "\n"
+            || in_array($vc, [';', '&', '|', '(', ')', '<', '>'], true);
+        if (!$isValueTerminator) {
+            $tok = $this->lexer->readWord();
+            $value = $tok['word'];
+            $valueEnd = $value->end;
+        } else {
+            $value = new Word('', $valueStart, $valueStart, null, '');
+        }
+
+        $props = [
+            'pos' => $pos,
+            'end' => $valueEnd,
+            'text' => substr($src, $pos, $valueEnd - $pos),
+            'name' => $name,
+            'value' => $value,
+            'append' => $append ?: null,
+            'index' => $index,
+            'array' => null,
+        ];
+        if ($indexParts !== null) {
+            $props['indexParts'] = $indexParts;
+        }
+        $this->lastEnd = $valueEnd;
+
+        return new Node('Assignment', $props);
+    }
+
+    private function isNameCharAt(string $src, int $i): bool
+    {
+        $c = $src[$i];
+
+        return ($c >= 'A' && $c <= 'Z') || ($c >= 'a' && $c <= 'z') || ($c >= '0' && $c <= '9') || $c === '_';
+    }
+
+    /** Index of the ']' matching the '[' at $from (quote/subst/nesting aware). */
+    private function matchBracket(int $from): int
+    {
+        $src = $this->lexer->source();
+        $i = $from;
+        $depth = 0;
+        while ($i < $this->end) {
+            $c = $src[$i];
+            if ($c === '\\') {
+                $i += 2;
+                continue;
+            }
+            if ($c === "'") {
+                $i++;
+                while ($i < $this->end && $src[$i] !== "'") {
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '"') {
+                $i++;
+                while ($i < $this->end && $src[$i] !== '"') {
+                    if ($src[$i] === '\\') {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '`') {
+                $i++;
+                while ($i < $this->end && $src[$i] !== '`') {
+                    if ($src[$i] === '\\') {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '$' && ($src[$i + 1] ?? '') === '(') {
+                $i = $this->matchParen($i + 1) + 1;
+                continue;
+            }
+            if ($c === '$' && ($src[$i + 1] ?? '') === '{') {
+                $i = $this->matchBrace($i + 1) + 1;
+                continue;
+            }
+            if ($c === '[') {
+                $depth++;
+            } elseif ($c === ']') {
+                $depth--;
+                if ($depth === 0) {
+                    return $i;
+                }
+            }
+            $i++;
+        }
+
+        return $i;
+    }
+
+    /**
      * @param array{type: string, op?: string, word?: Word, pos: int, end: int} $t
      */
     private function tryAssignment(array $t): ?Node
     {
         $text = $t['word']->text;
+
+        // Array assignment:  name=(...), name+=(...), name[idx]=(...)
+        if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?(\+?)=\(/', $text, $am) && str_ends_with($text, ')')) {
+            $word = $this->advance()['word'];
+            $openOffset = strlen($am[0]) - 1; // offset of '(' within the word
+            $array = $this->parseArrayElements($word->pos + $openOffset + 1, $word->end - 1);
+
+            return new Node('Assignment', [
+                'pos' => $word->pos,
+                'end' => $word->end,
+                'text' => $word->text,
+                'name' => $am[1],
+                'value' => null,
+                'append' => $am[3] === '+' ?: null,
+                'index' => $am[2] !== '' ? substr($am[2], 1, -1) : null,
+                'array' => $array,
+            ]);
+        }
+
         if (!preg_match('/^([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?(\+?)=(.*)$/s', $text, $m)) {
             return null;
         }
@@ -1183,41 +1371,10 @@ final class Parser
         $index = $m[2] !== '' ? substr($m[2], 1, -1) : null;
         $append = $m[3] === '+';
 
-        // Array assignment:  name=( ... )
-        if ($m[4] === '' && $this->isOp($this->peek(1), '(') && $this->peek(1)['pos'] === $t['end']) {
-            $word = $this->advance()['word']; // name= token
-            $this->advance(); // (
-            $array = [];
-            while (!$this->isOp($this->peek(), ')') && $this->peek()['type'] !== 'eof') {
-                if ($this->peek()['type'] === 'word') {
-                    $array[] = $this->advance()['word'];
-                } elseif ($this->peek()['type'] === 'newline') {
-                    $this->advance();
-                } else {
-                    break;
-                }
-            }
-            $end = $word->end;
-            if ($this->isOp($this->peek(), ')')) {
-                $end = $this->advance()['end'];
-            }
-
-            return new Node('Assignment', [
-                'pos' => $word->pos,
-                'end' => $end,
-                'text' => substr($this->lexer->source(), $word->pos, $end - $word->pos),
-                'name' => $name,
-                'value' => null,
-                'append' => $append ?: null,
-                'index' => $index,
-                'array' => $array,
-            ]);
-        }
-
         $word = $this->advance()['word'];
         $eqOffset = strlen($name) + strlen($m[2]) + strlen($m[3]) + 1;
         $valueStart = $word->pos + $eqOffset;
-        $value = $m[4] === '' ? null : $this->lexer->wordFromRegion($valueStart, $word->end);
+        $value = $this->lexer->wordFromRegion($valueStart, $word->end);
 
         return new Node('Assignment', [
             'pos' => $word->pos,
@@ -1229,6 +1386,30 @@ final class Parser
             'index' => $index,
             'array' => null,
         ]);
+    }
+
+    /**
+     * Parse array-assignment elements in the region [$start, $end).
+     *
+     * @return Word[]
+     */
+    private function parseArrayElements(int $start, int $end): array
+    {
+        $src = $this->lexer->source();
+        $sub = new Lexer($src, $start, $end);
+        $elements = [];
+        while (true) {
+            $tok = $sub->next();
+            if ($tok['type'] === 'eof') {
+                break;
+            }
+            if ($tok['type'] === 'word') {
+                $elements[] = $tok['word'];
+            }
+            // newlines and any stray operators are skipped
+        }
+
+        return $elements;
     }
 
     // --- Redirects --------------------------------------------------------

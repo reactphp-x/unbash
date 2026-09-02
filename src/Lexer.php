@@ -348,6 +348,12 @@ final class Lexer
                     $i = $ni;
                     continue;
                 }
+                // An array-assignment word: `name=(...)`, `name+=(...)`, or
+                // `name[idx]=(...)` keeps the parenthesized element list together.
+                if ($c === 40 && preg_match('/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=$/', $this->slice($pos, $i))) {
+                    $i = $this->matchArrayParen($i + 1);
+                    continue;
+                }
                 // In embedded mode (e.g. an array index) whitespace and shell
                 // operators are literal; only the region bound terminates.
                 if ($embedded && $c !== -1) {
@@ -801,6 +807,96 @@ final class Lexer
         $this->deferred[] = ['part' => $part, 'depth' => $this->nestingDepth];
 
         return [$close, $part];
+    }
+
+    /**
+     * Find the index just past the ')' closing an array-assignment element list.
+     * Comments (`#` at a word boundary) run to end of line, so an unpaired quote
+     * inside a comment does not swallow the closing paren.
+     */
+    private function matchArrayParen(int $from): int
+    {
+        $i = $from;
+        $depth = 0;
+        $boundary = true; // just after the opening '('
+        while ($i < $this->end) {
+            $c = $this->cc($i);
+            if ($c === 35 && $boundary) { // '#' comment
+                while ($i < $this->end && $this->cc($i) !== 10) {
+                    $i++;
+                }
+                $boundary = true;
+                continue;
+            }
+            if ($c === 32 || $c === 9 || $c === 10) {
+                $boundary = true;
+                $i++;
+                continue;
+            }
+            if ($c === 92) {
+                $i += ($i + 1 < $this->end) ? 2 : 1;
+                $boundary = false;
+                continue;
+            }
+            if ($c === 39) {
+                $i++;
+                while ($i < $this->end && $this->cc($i) !== 39) {
+                    $i++;
+                }
+                $i++;
+                $boundary = false;
+                continue;
+            }
+            if ($c === 34) {
+                $i++;
+                while ($i < $this->end && $this->cc($i) !== 34) {
+                    if ($this->cc($i) === 92) {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                $boundary = false;
+                continue;
+            }
+            if ($c === 96) {
+                $i++;
+                while ($i < $this->end && $this->cc($i) !== 96) {
+                    if ($this->cc($i) === 92) {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                $boundary = false;
+                continue;
+            }
+            if ($c === 36 && $this->cc($i + 1) === 40) { // $(
+                [$close] = $this->matchBalanced($i + 2, 40, 41);
+                $i = $close;
+                $boundary = false;
+                continue;
+            }
+            if ($c === 40) {
+                $depth++;
+                $boundary = true;
+                $i++;
+                continue;
+            }
+            if ($c === 41) {
+                if ($depth === 0) {
+                    return $i + 1;
+                }
+                $depth--;
+                $boundary = false;
+                $i++;
+                continue;
+            }
+            $boundary = false;
+            $i++;
+        }
+
+        return $i;
     }
 
     /** @return array{0:int,1:Node} */
