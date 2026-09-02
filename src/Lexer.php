@@ -100,6 +100,16 @@ final class Lexer
         return $this->makeWord($this->slice($start, $end), $start, true);
     }
 
+    /** Compute embedded word parts for a region (used for arithmetic word operands). */
+    public function embeddedWordParts(int $start, int $end): ?array
+    {
+        if ($end <= $start) {
+            return null;
+        }
+
+        return $this->partsOf($this->slice($start, $end), $start, true);
+    }
+
     private function cc(int $i): int
     {
         return $i < $this->end ? ord($this->source[$i]) : -1;

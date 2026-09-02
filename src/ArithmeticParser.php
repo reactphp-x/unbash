@@ -138,9 +138,11 @@ final class ArithmeticParser
             return $this->parseUnary();
         }
         $left = $this->parseBinary($level + 1);
+        // `**` is right-associative; every other level is left-associative.
+        $rightAssoc = in_array('**', self::PRECEDENCE[$level], true);
         while (($op = $this->peekOp()) !== null && in_array($op, self::PRECEDENCE[$level], true)) {
             $this->takeOp();
-            $right = $this->parseBinary($level + 1);
+            $right = $rightAssoc ? $this->parseBinary($level) : $this->parseBinary($level + 1);
             $left = new Node('ArithmeticBinary', [
                 'pos' => $left->pos,
                 'end' => $right->end,
@@ -148,6 +150,9 @@ final class ArithmeticParser
                 'left' => $left,
                 'right' => $right,
             ]);
+            if ($rightAssoc) {
+                break;
+            }
         }
 
         return $left;
@@ -217,16 +222,56 @@ final class ArithmeticParser
             ]);
         }
 
-        if ($c === '$' && $this->i + 1 < $this->n && $this->s[$this->i + 1] === '(' && ($this->s[$this->i + 2] ?? '') !== '(') {
-            return $this->parseCommandExpansion($start);
-        }
-
-        // A word operand: number, identifier, or $-expansion run.
+        // A word operand: number, identifier, or a run containing $-expansions,
+        // `${...}`, `$((...))`, backticks, quotes, and `[...]` subscripts (all opaque
+        // so operators inside them do not terminate the operand).
         $j = $this->i;
         while ($j < $this->n) {
             $ch = $this->s[$j];
             if (ctype_space($ch)) {
                 break;
+            }
+            if ($ch === '$' && ($this->s[$j + 1] ?? '') === '(') {
+                $j = $this->skipParenIn($j + 1);
+                continue;
+            }
+            if ($ch === '$' && ($this->s[$j + 1] ?? '') === '{') {
+                $j = $this->skipBraceIn($j + 1);
+                continue;
+            }
+            if ($ch === '`') {
+                $j++;
+                while ($j < $this->n && $this->s[$j] !== '`') {
+                    if ($this->s[$j] === '\\') {
+                        $j++;
+                    }
+                    $j++;
+                }
+                $j++;
+                continue;
+            }
+            if ($ch === "'") {
+                $j++;
+                while ($j < $this->n && $this->s[$j] !== "'") {
+                    $j++;
+                }
+                $j++;
+                continue;
+            }
+            if ($ch === '"') {
+                $j++;
+                while ($j < $this->n && $this->s[$j] !== '"') {
+                    if ($this->s[$j] === '\\') {
+                        $j++;
+                    }
+                    $j++;
+                }
+                $j++;
+                continue;
+            }
+            if ($ch === '[') {
+                $j = $this->skipBracketIn($j);
+                continue;
             }
             if (strpos('+-*/%&|^~!<>=?:,()', $ch) !== false) {
                 break;
@@ -237,13 +282,34 @@ final class ArithmeticParser
             throw new \RuntimeException('empty arithmetic operand');
         }
         $value = substr($this->s, $this->i, $j - $this->i);
+        $runStart = $this->i;
         $this->i = $j;
 
-        return new Node('ArithmeticWord', [
-            'pos' => $start,
-            'end' => $this->base + $j,
-            'value' => $value,
-        ]);
+        // A run that is exactly one `$(...)` (not `$((`) is a command substitution.
+        if (str_starts_with($value, '$(') && ($value[2] ?? '') !== '('
+            && $this->skipParenIn($runStart + 1) === $j) {
+            $innerStart = $this->base + $runStart + 2;
+            $inner = substr($value, 2, -1);
+            $node = new Node('ArithmeticCommandExpansion', [
+                'pos' => $start,
+                'end' => $this->base + $j,
+                'text' => $value,
+                'inner' => $inner,
+                'script' => null,
+                'innerStart' => $innerStart,
+            ]);
+            $this->lexer->registerDeferred($node);
+
+            return $node;
+        }
+
+        $parts = $this->lexer->embeddedWordParts($start, $this->base + $j);
+        $props = ['pos' => $start, 'end' => $this->base + $j, 'value' => $value];
+        if ($parts !== null) {
+            $props['parts'] = $parts;
+        }
+
+        return new Node('ArithmeticWord', $props);
     }
 
     private function parseCommandExpansion(int $start): Node
@@ -303,6 +369,98 @@ final class ArithmeticParser
         $this->lexer->registerDeferred($node);
 
         return $node;
+    }
+
+    /** Index just past the ')' matching the '(' at $from in $this->s. */
+    private function skipParenIn(int $from): int
+    {
+        $i = $from;
+        $depth = 0;
+        while ($i < $this->n) {
+            $c = $this->s[$i];
+            if ($c === '\\') {
+                $i += 2;
+                continue;
+            }
+            if ($c === "'") {
+                $i++;
+                while ($i < $this->n && $this->s[$i] !== "'") {
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '"') {
+                $i++;
+                while ($i < $this->n && $this->s[$i] !== '"') {
+                    if ($this->s[$i] === '\\') {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '(') {
+                $depth++;
+            } elseif ($c === ')') {
+                $depth--;
+                if ($depth === 0) {
+                    return $i + 1;
+                }
+            }
+            $i++;
+        }
+
+        return $i;
+    }
+
+    private function skipBraceIn(int $from): int
+    {
+        $i = $from;
+        $depth = 0;
+        while ($i < $this->n) {
+            $c = $this->s[$i];
+            if ($c === '\\') {
+                $i += 2;
+                continue;
+            }
+            if ($c === '{') {
+                $depth++;
+            } elseif ($c === '}') {
+                $depth--;
+                if ($depth === 0) {
+                    return $i + 1;
+                }
+            }
+            $i++;
+        }
+
+        return $i;
+    }
+
+    private function skipBracketIn(int $from): int
+    {
+        $i = $from;
+        $depth = 0;
+        while ($i < $this->n) {
+            $c = $this->s[$i];
+            if ($c === '\\') {
+                $i += 2;
+                continue;
+            }
+            if ($c === '[') {
+                $depth++;
+            } elseif ($c === ']') {
+                $depth--;
+                if ($depth === 0) {
+                    return $i + 1;
+                }
+            }
+            $i++;
+        }
+
+        return $i;
     }
 
     private function skipWs(): void
