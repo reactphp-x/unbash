@@ -231,7 +231,7 @@ final class Parser
      * @param string[] $stopWords
      * @param string[] $stopOps
      */
-    private const TERMINATOR_WORDS = ['then', 'else', 'elif', 'fi', 'do', 'done', 'esac', 'in', '}'];
+    private const TERMINATOR_WORDS = ['then', 'else', 'elif', 'fi', 'do', 'done', 'esac', 'in', '}', ']]'];
     private const TERMINATOR_OPS = [')', ';;', ';&', ';;&'];
 
     /**
@@ -473,6 +473,129 @@ final class Parser
         $m = $this->matchParen($openStart + 1);
 
         return $m + 1 < $this->end && ($src[$m + 1] ?? '') === ')';
+    }
+
+    /**
+     * Scan a `=~` regex operand from $from and return its end index.
+     */
+    private function scanRegexOperand(int $from): int
+    {
+        $src = $this->lexer->source();
+        $i = $from;
+        $depth = 0;
+        while ($i < $this->end) {
+            $c = $src[$i];
+            if ($depth === 0) {
+                if ($c === ' ' || $c === "\t" || $c === "\n" || $c === ';' || $c === '&' || $c === '|') {
+                    break;
+                }
+                if ($c === '<' || $c === '>') {
+                    if (($i + 1 < $this->end) && $src[$i + 1] === '(') {
+                        $i = $this->matchParen($i + 1) + 1;
+                        continue;
+                    }
+                    break;
+                }
+                if ($c === ')') {
+                    break;
+                }
+            }
+            if ($c === '\\') {
+                $i += 2;
+                continue;
+            }
+            if ($c === "'") {
+                $i++;
+                while ($i < $this->end && $src[$i] !== "'") {
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '"') {
+                $i++;
+                while ($i < $this->end && $src[$i] !== '"') {
+                    if ($src[$i] === '\\') {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '`') {
+                $i++;
+                while ($i < $this->end && $src[$i] !== '`') {
+                    if ($src[$i] === '\\') {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '$' && ($i + 1 < $this->end) && $src[$i + 1] === '(') {
+                $i = $this->matchParen($i + 1) + 1;
+                continue;
+            }
+            if ($c === '$' && ($i + 1 < $this->end) && $src[$i + 1] === '{') {
+                $i = $this->matchBrace($i + 1) + 1;
+                continue;
+            }
+            if ($c === '(') {
+                $depth++;
+            } elseif ($c === ')') {
+                $depth--;
+            }
+            $i++;
+        }
+
+        return $i;
+    }
+
+    /** Index of the '}' matching the '{' at $from (quote-aware). */
+    private function matchBrace(int $from): int
+    {
+        $src = $this->lexer->source();
+        $i = $from;
+        $depth = 0;
+        while ($i < $this->end) {
+            $c = $src[$i];
+            if ($c === '\\') {
+                $i += 2;
+                continue;
+            }
+            if ($c === "'") {
+                $i++;
+                while ($i < $this->end && $src[$i] !== "'") {
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '"') {
+                $i++;
+                while ($i < $this->end && $src[$i] !== '"') {
+                    if ($src[$i] === '\\') {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '{') {
+                $depth++;
+            } elseif ($c === '}') {
+                $depth--;
+                if ($depth === 0) {
+                    return $i;
+                }
+            }
+            $i++;
+        }
+
+        return $i;
     }
 
     /** Index of the ')' matching the '(' at $from (quote/nesting aware). */
@@ -900,8 +1023,9 @@ final class Parser
         $left = $this->advance()['word'];
         $next = $this->peek();
 
-        // `=~` right-hand side is a regex: parens, `|`, etc. are regex syntax,
-        // so read it as a raw (whitespace-delimited) operand from the source.
+        // `=~` right-hand side is a regex operand: parens form groups (spaces are
+        // allowed inside), quotes/expansions are opaque, and at paren depth 0 the
+        // operand ends at whitespace or one of ) ; & | < >.
         if ($next['type'] === 'word' && $next['word']->text === '=~') {
             $op = $this->advance();
             $src = $this->lexer->source();
@@ -910,28 +1034,15 @@ final class Parser
                 $i++;
             }
             $rhsStart = $i;
-            if ($i < $this->end && ($src[$i] === '"' || $src[$i] === "'")) {
-                $right = $this->peek()['type'] === 'word' ? $this->advance()['word'] : $left;
-
-                return new Node('TestBinary', [
-                    'pos' => $left->pos,
-                    'end' => $right->end,
-                    'operator' => '=~',
-                    'left' => $left,
-                    'right' => $right,
-                ]);
-            }
-            while ($i < $this->end && !ctype_space($src[$i])) {
-                $i++;
-            }
-            $right = $this->lexer->wordFromRegion($rhsStart, $i);
-            $this->lexer->seek($i);
+            $end = $this->scanRegexOperand($rhsStart);
+            $right = $this->lexer->wordFromRegionEmbedded($rhsStart, $end);
+            $this->lexer->seek($end);
             $this->buf = [];
-            $this->lastEnd = $i;
+            $this->lastEnd = $end;
 
             return new Node('TestBinary', [
                 'pos' => $left->pos,
-                'end' => $i,
+                'end' => $end,
                 'operator' => '=~',
                 'left' => $left,
                 'right' => $right,

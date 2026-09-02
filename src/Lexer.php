@@ -94,6 +94,12 @@ final class Lexer
         return $this->makeWord($this->slice($start, $end), $start);
     }
 
+    /** Build a {@see Word} for a region using embedded scanning (whitespace/operators literal). */
+    public function wordFromRegionEmbedded(int $start, int $end): Word
+    {
+        return $this->makeWord($this->slice($start, $end), $start, true);
+    }
+
     private function cc(int $i): int
     {
         return $i < $this->end ? ord($this->source[$i]) : -1;
