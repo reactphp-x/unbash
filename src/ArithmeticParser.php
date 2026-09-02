@@ -312,65 +312,6 @@ final class ArithmeticParser
         return new Node('ArithmeticWord', $props);
     }
 
-    private function parseCommandExpansion(int $start): Node
-    {
-        // Find matching ')', skipping quoted regions and nested parens.
-        $depth = 0;
-        $j = $this->i + 2;
-        while ($j < $this->n) {
-            $ch = $this->s[$j];
-            if ($ch === '\\') {
-                $j += 2;
-                continue;
-            }
-            if ($ch === "'") {
-                $j++;
-                while ($j < $this->n && $this->s[$j] !== "'") {
-                    $j++;
-                }
-                $j++;
-                continue;
-            }
-            if ($ch === '"') {
-                $j++;
-                while ($j < $this->n && $this->s[$j] !== '"') {
-                    if ($this->s[$j] === '\\') {
-                        $j++;
-                    }
-                    $j++;
-                }
-                $j++;
-                continue;
-            }
-            if ($ch === '(') {
-                $depth++;
-            } elseif ($ch === ')') {
-                if ($depth === 0) {
-                    break;
-                }
-                $depth--;
-            }
-            $j++;
-        }
-        $innerStart = $this->base + $this->i + 2;
-        $inner = substr($this->s, $this->i + 2, $j - ($this->i + 2));
-        $end = ($j < $this->n) ? $j + 1 : $j;
-        $text = substr($this->s, $this->i, $end - $this->i);
-        $this->i = $end;
-
-        $node = new Node('ArithmeticCommandExpansion', [
-            'pos' => $start,
-            'end' => $this->base + $end,
-            'text' => $text,
-            'inner' => $inner,
-            'script' => null,
-            'innerStart' => $innerStart,
-        ]);
-        $this->lexer->registerDeferred($node);
-
-        return $node;
-    }
-
     /** Index just past the ')' matching the '(' at $from in $this->s. */
     private function skipParenIn(int $from): int
     {

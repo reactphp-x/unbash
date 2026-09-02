@@ -1195,12 +1195,7 @@ final class Lexer
                 $p++;
             }
             $patStart = $p;
-            while ($p < strlen($rest) && $rest[$p] !== '/') {
-                if ($rest[$p] === '\\') {
-                    $p++;
-                }
-                $p++;
-            }
+            $p = $this->scanToReplaceSlash($rest, $p);
             $pattern = substr($rest, $patStart, $p - $patStart);
             $replacement = '';
             $repStart = $p;
@@ -1292,6 +1287,103 @@ final class Lexer
             if ($c === '(') {
                 $depth++;
             } elseif ($c === ')') {
+                $depth--;
+                if ($depth === 0) {
+                    return $i + 1;
+                }
+            }
+            $i++;
+        }
+
+        return $i;
+    }
+
+    /**
+     * Advance over a replacement pattern in $s from $p to the separating '/',
+     * skipping quotes, ANSI-C strings, and command/parameter substitutions.
+     */
+    private function scanToReplaceSlash(string $s, int $p): int
+    {
+        $n = strlen($s);
+        while ($p < $n) {
+            $c = $s[$p];
+            if ($c === '/') {
+                return $p;
+            }
+            if ($c === '\\') {
+                $p += 2;
+                continue;
+            }
+            if ($c === "'") {
+                $p++;
+                while ($p < $n && $s[$p] !== "'") {
+                    $p++;
+                }
+                $p++;
+                continue;
+            }
+            if ($c === '"') {
+                $p++;
+                while ($p < $n && $s[$p] !== '"') {
+                    if ($s[$p] === '\\') {
+                        $p++;
+                    }
+                    $p++;
+                }
+                $p++;
+                continue;
+            }
+            if ($c === '`') {
+                $p++;
+                while ($p < $n && $s[$p] !== '`') {
+                    if ($s[$p] === '\\') {
+                        $p++;
+                    }
+                    $p++;
+                }
+                $p++;
+                continue;
+            }
+            if ($c === '$' && ($s[$p + 1] ?? '') === "'") { // $'...' ANSI-C
+                $p += 2;
+                while ($p < $n && $s[$p] !== "'") {
+                    if ($s[$p] === '\\') {
+                        $p++;
+                    }
+                    $p++;
+                }
+                $p++;
+                continue;
+            }
+            if ($c === '$' && ($s[$p + 1] ?? '') === '(') {
+                $p = $this->skipParenInString($s, $p + 1);
+                continue;
+            }
+            if ($c === '$' && ($s[$p + 1] ?? '') === '{') {
+                $p = $this->skipBraceInString($s, $p + 1);
+                continue;
+            }
+            $p++;
+        }
+
+        return $p;
+    }
+
+    /** Index just past the '}' matching the '{' at $from in string $s. */
+    private function skipBraceInString(string $s, int $from): int
+    {
+        $i = $from;
+        $n = strlen($s);
+        $depth = 0;
+        while ($i < $n) {
+            $c = $s[$i];
+            if ($c === '\\') {
+                $i += 2;
+                continue;
+            }
+            if ($c === '{') {
+                $depth++;
+            } elseif ($c === '}') {
                 $depth--;
                 if ($depth === 0) {
                     return $i + 1;
