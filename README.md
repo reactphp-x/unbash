@@ -167,15 +167,20 @@ php examples/parse.php 'echo "$HOME" | tr a-z A-Z'
 
 ### Tests
 
-The suite includes the package's own tests plus a PHP port of the upstream
-[`webpro-nl/unbash`](https://github.com/webpro-nl/unbash) test suite under
-`tests/Reference/` (parser, quoting, word parts, pipelines, redirects, positions,
-brace/extglob/process/command substitutions, parameter expansions, compound
-commands, `[[ ]]` test expressions, arithmetic, assignments, heredocs, deep
-nesting, error recovery, tokenizer, round-trip). A small number of reference
-cases that exercise behaviors this port does not model (e.g. some `$()`
-extent-scanner edge cases, escaped-backtick decoded `source`, and per-construct
-depth-budget error messages) are marked skipped with a reason.
+The suite includes the package's own tests plus a PHP port of the **entire**
+upstream [`webpro-nl/unbash`](https://github.com/webpro-nl/unbash) test suite
+under `tests/Reference/` — parser, quoting, word parts, pipelines, redirects,
+positions/offset, brace/extglob/process/command substitutions, parameter
+expansions, compound commands, `[[ ]]` test expressions, arithmetic, assignments,
+heredocs, deep nesting, error recovery, tokenizer, round-trip, plus the
+corpus-driven `fixtures`, `tree-sitter-compat`, and `mvdan-sh-compat` suites (the
+upstream fixture corpora are vendored under `tests/fixtures/`). The mvdan/sh
+corpus is checked against `filetests_snapshot.txt` (top-level command types).
+
+A small number of reference cases that exercise behaviors this port does not
+model — some `$()` extent-scanner edge cases, escaped-backtick decoded `source`,
+per-construct depth-budget error messages, and reference-specific recovery of a
+few invalid/ambiguous inputs — are marked skipped with a reason.
 
 ## Credits
 
