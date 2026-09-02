@@ -28,6 +28,8 @@ final class Parser
 
     private int $lastEnd;
 
+    private bool $lastStmtSeparated = false;
+
     private const COMPOUND_KEYWORDS = [
         'if', 'for', 'while', 'until', 'case', 'select', 'function', 'coproc',
     ];
@@ -199,9 +201,21 @@ final class Parser
                 continue;
             }
             $before = $this->peek();
+            $this->lastStmtSeparated = false;
             $stmt = $this->parseStatement();
             if ($stmt !== null) {
                 $statements[] = $stmt;
+            }
+            // Two commands in a list must be separated by ';', '&', or a newline;
+            // only a reserved-word list terminator may follow without one.
+            $t = $this->peek();
+            if ($stmt !== null && !$this->lastStmtSeparated
+                && $t['type'] !== 'newline' && $t['type'] !== 'eof'
+                && !$this->isOp($t, ';')
+                && !$this->atStop($stopWords, $stopOps)
+                && !$this->isUnexpectedTerminator($t)) {
+                $tok = $t['type'] === 'op' ? $t['op'] : ($t['word']->text ?? '');
+                $this->error("unexpected token '$tok'", $t['pos']);
             }
             // Guard against non-progress on unexpected tokens.
             if ($this->peek() === $before && $before['type'] !== 'eof') {
@@ -271,9 +285,11 @@ final class Parser
             $background = true;
             $end = $t['end'];
             $this->advance();
+            $this->lastStmtSeparated = true;
         } elseif ($this->isOp($t, ';')) {
             // A trailing ';' terminates but is not part of the statement span.
             $this->advance();
+            $this->lastStmtSeparated = true;
         }
 
         return new Node('Statement', [
@@ -405,7 +421,7 @@ final class Parser
         // ( subshell )  or  (( arithmetic ))
         if ($this->isOp($t, '(')) {
             $t1 = $this->peek(1);
-            if ($this->isOp($t1, '(') && $t1['pos'] === $t['end']) {
+            if ($this->isOp($t1, '(') && $t1['pos'] === $t['end'] && $this->isArithmeticOpen($t['pos'])) {
                 return $this->parseArithmeticCommand();
             }
 
@@ -444,6 +460,64 @@ final class Parser
         }
 
         return $this->parseSimpleCommand();
+    }
+
+    /**
+     * `((` opens an arithmetic command only when the inner `(` pair is immediately
+     * followed by `)` (i.e. the whole thing closes as `))`); otherwise it is a
+     * nested subshell like `( (a) )`.
+     */
+    private function isArithmeticOpen(int $openStart): bool
+    {
+        $src = $this->lexer->source();
+        $m = $this->matchParen($openStart + 1);
+
+        return $m + 1 < $this->end && ($src[$m + 1] ?? '') === ')';
+    }
+
+    /** Index of the ')' matching the '(' at $from (quote/nesting aware). */
+    private function matchParen(int $from): int
+    {
+        $src = $this->lexer->source();
+        $i = $from;
+        $depth = 0;
+        while ($i < $this->end) {
+            $c = $src[$i];
+            if ($c === '\\') {
+                $i += 2;
+                continue;
+            }
+            if ($c === "'") {
+                $i++;
+                while ($i < $this->end && $src[$i] !== "'") {
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '"') {
+                $i++;
+                while ($i < $this->end && $src[$i] !== '"') {
+                    if ($src[$i] === '\\') {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
+                continue;
+            }
+            if ($c === '(') {
+                $depth++;
+            } elseif ($c === ')') {
+                $depth--;
+                if ($depth === 0) {
+                    return $i;
+                }
+            }
+            $i++;
+        }
+
+        return $i;
     }
 
     private function parseSubshell(): Node
@@ -695,12 +769,26 @@ final class Parser
     {
         $start = $this->advance(); // coproc
         $this->skipNewlines();
+
+        // `coproc NAME compound-command`: NAME appears only when it is an
+        // identifier immediately followed by a compound command.
+        $name = null;
+        $t = $this->peek();
+        if ($t['type'] === 'word' && preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $t['word']->text)) {
+            $next = $this->peek(1);
+            $compoundStart = ($next['type'] === 'op' && $next['op'] === '(')
+                || ($next['type'] === 'word' && in_array($this->kwText($next), ['{', '[[', 'if', 'for', 'while', 'until', 'case', 'select'], true));
+            if ($compoundStart) {
+                $name = $this->advance()['word'];
+            }
+        }
+
         $body = $this->parseCommand() ?? new Node('CompoundList', ['pos' => $start['end'], 'end' => $start['end'], 'commands' => []]);
 
         return new Node('Coproc', [
             'pos' => $start['pos'],
             'end' => $body->end,
-            'name' => null,
+            'name' => $name,
             'body' => $body,
             'redirects' => [],
         ]);
