@@ -19,7 +19,7 @@ final class RealWorldTest extends TestCase
         // nvm-install.sh wraps the whole script in { ... } so it runs only when
         // fully downloaded.
         $ast = parse("{\nfoo() { echo hi; }\nbar\n} # guarded");
-        $this->assertSame([], $ast->errors);
+        $this->assertNull($ast->errors);
         $this->assertCount(1, $ast->commands);
         $this->assertSame('BraceGroup', $ast->commands[0]->command->type);
     }
@@ -28,7 +28,7 @@ final class RealWorldTest extends TestCase
     {
         // Bash `for ((...)) { ...; }` alternative to do/done (used by neofetch).
         $ast = parse('for ((i = 0; i < 10; i++)) { echo $i; }');
-        $this->assertSame([], $ast->errors);
+        $this->assertNull($ast->errors);
         $f = $ast->commands[0]->command;
         $this->assertSame('ArithmeticFor', $f->type);
         $this->assertSame('CompoundList', $f->body->type);
@@ -38,7 +38,7 @@ final class RealWorldTest extends TestCase
     public function testBraceFormForIn(): void
     {
         $ast = parse('for x in a b c { echo $x; }');
-        $this->assertSame([], $ast->errors);
+        $this->assertNull($ast->errors);
         $this->assertSame('For', $ast->commands[0]->command->type);
     }
 
@@ -46,7 +46,7 @@ final class RealWorldTest extends TestCase
     {
         // `=~` right-hand side is a regex: parens/pipes are regex syntax.
         $ast = parse('[[ $os =~ (AIX|IRIX) ]] && echo yes');
-        $this->assertSame([], $ast->errors);
+        $this->assertNull($ast->errors);
         $test = $ast->commands[0]->command->commands[0];
         $this->assertSame('TestCommand', $test->type);
         $this->assertSame('=~', $test->expression->operator);
@@ -57,7 +57,7 @@ final class RealWorldTest extends TestCase
     {
         // A quoted ')' inside $(( ... $(...) ... )) must not desync the scan.
         $ast = parse('n=$(($(awk -F "\\\\/ |)" \'{print $2}\' file) / 1024))');
-        $this->assertSame([], $ast->errors);
+        $this->assertNull($ast->errors);
         $asg = $ast->commands[0]->command->prefix[0];
         $this->assertSame('n', $asg->name);
         $this->assertSame('ArithmeticExpansion', $asg->value->parts[0]->type);
@@ -66,14 +66,14 @@ final class RealWorldTest extends TestCase
     public function testTestLineContinuationAfterOperator(): void
     {
         $ast = parse("[[ -f a ||\n   -f b ]]");
-        $this->assertSame([], $ast->errors);
+        $this->assertNull($ast->errors);
         $this->assertSame('TestLogical', $ast->commands[0]->command->expression->type);
     }
 
     public function testDeeplyNestedCommandSubstitution(): void
     {
         $ast = parse('a=$(b=$(c=$(echo deep)))');
-        $this->assertSame([], $ast->errors);
+        $this->assertNull($ast->errors);
         $this->assertSame('CommandExpansion', $ast->commands[0]->command->prefix[0]->value->parts[0]->type);
     }
 }

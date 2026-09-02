@@ -59,13 +59,17 @@ final class Parser
         $commands = $this->parseStatements([], []);
         $this->resolveDeferred();
 
+        $errors = array_merge($this->lexer->errors(), $this->errors);
+        usort($errors, static fn (ParseError $a, ParseError $b) => $a->pos <=> $b->pos);
+
         $script = new Node('Script', [
             'pos' => $this->start,
             'end' => $this->lastEnd,
             'shebang' => $shebang,
             'commands' => $commands,
         ]);
-        $script->errors = $this->errors;
+        // Match the reference: `errors` is absent/null when there are none.
+        $script->errors = $errors === [] ? null : $errors;
 
         return $script;
     }
@@ -117,7 +121,17 @@ final class Parser
             return false;
         }
 
-        return $text === null || $t['word']->text === $text;
+        return $text === null || $this->kwText($t) === $text;
+    }
+
+    /** Reserved-word candidate text: line continuations are removed, other escapes/quotes are not. */
+    private function kwText(array $t): string
+    {
+        if ($t['type'] !== 'word') {
+            return '';
+        }
+
+        return str_replace("\\\n", '', $t['word']->text);
     }
 
     private function isOp(array $t, string ...$ops): bool
@@ -174,6 +188,16 @@ final class Parser
         $statements = [];
         $this->skipTerminators();
         while (!$this->atStop($stopWords, $stopOps)) {
+            $t = $this->peek();
+            // An out-of-place list terminator (keyword or operator) that is not a
+            // stop at this level is unexpected: report and skip past it.
+            if ($this->isUnexpectedTerminator($t)) {
+                $tok = $t['type'] === 'op' ? $t['op'] : $t['word']->text;
+                $this->error("unexpected token '$tok'", $t['pos']);
+                $this->advance();
+                $this->skipTerminators();
+                continue;
+            }
             $before = $this->peek();
             $stmt = $this->parseStatement();
             if ($stmt !== null) {
@@ -193,6 +217,24 @@ final class Parser
      * @param string[] $stopWords
      * @param string[] $stopOps
      */
+    private const TERMINATOR_WORDS = ['then', 'else', 'elif', 'fi', 'do', 'done', 'esac', 'in', '}'];
+    private const TERMINATOR_OPS = [')', ';;', ';&', ';;&'];
+
+    /**
+     * @param array{type: string, op?: string, word?: Word, pos: int, end: int} $t
+     */
+    private function isUnexpectedTerminator(array $t): bool
+    {
+        if ($t['type'] === 'word') {
+            return in_array($t['word']->text, self::TERMINATOR_WORDS, true);
+        }
+        if ($t['type'] === 'op') {
+            return in_array($t['op'], self::TERMINATOR_OPS, true);
+        }
+
+        return false;
+    }
+
     private function parseCompoundList(array $stopWords, array $stopOps): Node
     {
         $startPos = $this->peek()['pos'];
@@ -255,10 +297,12 @@ final class Parser
         $commands = [$left];
         $operators = [];
         while ($this->isOp($this->peek(), '&&', '||')) {
-            $operators[] = $this->advance()['op'];
+            $op = $this->advance()['op'];
+            $operators[] = $op;
             $this->skipNewlines();
             $next = $this->parsePipeline();
             if ($next === null) {
+                $this->error("expected command after '$op'", $this->peek()['pos']);
                 break;
             }
             $commands[] = $next;
@@ -284,44 +328,63 @@ final class Parser
         $startPos = $this->peek()['pos'];
         $negated = false;
         $time = false;
+        $seenBang = false;
+        $prefixEnd = $startPos;
         while (true) {
             $t = $this->peek();
             if ($this->isWord($t, '!')) {
-                $negated = !$negated;
-                $this->advance();
+                if (!$seenBang) {
+                    $negated = true;
+                    $seenBang = true;
+                    $prefixEnd = $t['end'];
+                    $this->advance();
+                } else {
+                    // A second '!' is a syntax error; stop consuming prefixes so
+                    // the remaining tokens are parsed as the (negated) command.
+                    $this->error("unexpected token '!'", $t['pos']);
+                    break;
+                }
                 continue;
             }
             if ($this->isWord($t, 'time')) {
                 $time = true;
+                $prefixEnd = $t['end'];
                 $this->advance();
+                // Consume the optional unquoted POSIX `-p` flag.
+                $flag = $this->peek();
+                if ($flag['type'] === 'word' && $flag['word']->text === '-p') {
+                    $prefixEnd = $flag['end'];
+                    $this->advance();
+                }
                 continue;
             }
             break;
         }
 
         $first = $this->parseCommand();
-        if ($first === null) {
-            return null;
-        }
-        $commands = [$first];
+        $commands = $first !== null ? [$first] : [];
         $operators = [];
         while ($this->isOp($this->peek(), '|', '|&')) {
-            $operators[] = $this->advance()['op'];
+            $op = $this->advance()['op'];
+            $operators[] = $op;
             $this->skipNewlines();
             $next = $this->parseCommand();
             if ($next === null) {
+                $this->error("expected command after '$op'", $this->peek()['pos']);
                 break;
             }
             $commands[] = $next;
         }
 
-        if (count($commands) === 1 && !$negated && !$time) {
+        if (count($commands) <= 1 && !$negated && !$time) {
             return $first;
         }
 
+        $end = $commands === [] ? $prefixEnd : $commands[count($commands) - 1]->end;
+
         return new Node('Pipeline', [
             'pos' => $startPos,
-            'end' => $commands[count($commands) - 1]->end,
+            'end' => $end,
             'commands' => $commands,
             'negated' => $negated ?: null,
             'operators' => $operators,
@@ -350,7 +413,7 @@ final class Parser
         }
 
         if ($t['type'] === 'word') {
-            $text = $t['word']->text;
+            $text = $this->kwText($t);
             if ($text === '{') {
                 return $this->parseBraceGroup();
             }
@@ -421,8 +484,11 @@ final class Parser
     private function parseIfRest(int $pos): Node
     {
         $clause = $this->parseCompoundList(['then'], []);
-        $this->expectWord('then');
+        $thenFound = $this->expectWord('then') !== null;
         $then = $this->parseCompoundList(['elif', 'else', 'fi'], []);
+        if ($thenFound && $then->commands === []) {
+            $this->error("expected command after 'then'", $this->peek()['pos']);
+        }
         $else = null;
         $end = $then->end;
 
@@ -1016,38 +1082,47 @@ final class Parser
         $operator = $opTok['op'];
         $end = $opTok['end'];
 
+        // Locate where a target is expected (skip blanks and line continuations
+        // in the raw source, so a comment or EOF is not mistaken for a target).
+        $src = $this->lexer->source();
+        $i = $opTok['end'];
+        while ($i < $this->end) {
+            if ($src[$i] === ' ' || $src[$i] === "\t") {
+                $i++;
+            } elseif ($src[$i] === '\\' && ($i + 1 < $this->end) && $src[$i + 1] === "\n") {
+                $i += 2;
+            } else {
+                break;
+            }
+        }
+        $targetPos = $i;
+        $terminators = ["\n", ';', '&', '|', '(', ')', '<', '>', '#'];
+        $hasTarget = $i < $this->end && !in_array($src[$i], $terminators, true);
+        // `<(...)` / `>(...)` process substitutions are valid redirect targets.
+        if (!$hasTarget && $i < $this->end && ($src[$i] === '<' || $src[$i] === '>')
+            && ($i + 1 < $this->end) && $src[$i + 1] === '(') {
+            $hasTarget = true;
+        }
+
         $target = null;
-        $heredocQuoted = null;
-
-        if ($operator === '<<' || $operator === '<<-') {
-            $delim = $this->readWordToken();
-            $target = $delim;
-            $end = $delim->end;
-            $quoted = $delim->parts !== null || strpbrk($delim->text, "'\"\\") !== false;
-            $node = new Node('Redirect', [
-                'pos' => $pos,
-                'end' => $end,
-                'operator' => $operator,
-                'target' => $target,
-                'fileDescriptor' => $fd,
-                'variableName' => $varName,
-                'content' => null,
-                'heredocQuoted' => $quoted ?: null,
-                'body' => null,
-            ]);
-            $this->lexer->registerHeredoc($node, $delim->value, $quoted, $operator === '<<-');
-            // Re-sync lookahead: heredoc bodies are consumed on the next newline
-            // pulled from the lexer, and our buffer has none past this point.
-
-            return $node;
+        if ($hasTarget) {
+            $this->buf = [];
+            $this->lexer->seek($targetPos);
+            $tw = $this->peek();
+            if ($tw['type'] === 'word') {
+                $target = $this->advance()['word'];
+                $end = $target->end;
+            } else {
+                $hasTarget = false;
+            }
+        }
+        if (!$hasTarget) {
+            $this->error('expected redirect target', $targetPos);
+            $this->buf = [];
+            $this->lexer->seek($targetPos);
         }
 
-        if ($this->peek()['type'] === 'word') {
-            $target = $this->advance()['word'];
-            $end = $target->end;
-        }
-
-        return new Node('Redirect', [
+        $node = new Node('Redirect', [
             'pos' => $pos,
             'end' => $end,
             'operator' => $operator,
@@ -1055,9 +1130,17 @@ final class Parser
             'fileDescriptor' => $fd,
             'variableName' => $varName,
             'content' => null,
-            'heredocQuoted' => $heredocQuoted,
+            'heredocQuoted' => null,
             'body' => null,
         ]);
+
+        if (($operator === '<<' || $operator === '<<-') && $target !== null) {
+            $quoted = $target->parts !== null || strpbrk($target->text, "'\"\\") !== false;
+            $node->heredocQuoted = $quoted ?: null;
+            $this->lexer->registerHeredoc($node, $target->value, $quoted, $operator === '<<-');
+        }
+
+        return $node;
     }
 
     // --- Small helpers ----------------------------------------------------

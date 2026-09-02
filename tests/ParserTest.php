@@ -17,7 +17,7 @@ final class ParserTest extends TestCase
         $ast = parse('');
         $this->assertSame('Script', $ast->type);
         $this->assertSame([], $ast->commands);
-        $this->assertSame([], $ast->errors);
+        $this->assertNull($ast->errors);
     }
 
     public function testSimpleCommand(): void

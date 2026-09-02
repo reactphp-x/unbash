@@ -31,6 +31,9 @@ final class Lexer
     /** @var array<int, array{part: Node, depth: int}> */
     private array $deferred = [];
 
+    /** @var ParseError[] */
+    private array $errors = [];
+
     /** @var array<int, array{redirect: Node, delim: string, quoted: bool, strip: bool}> */
     private array $pendingHeredocs = [];
 
@@ -72,6 +75,17 @@ final class Lexer
     public function registerDeferred(Node $part): void
     {
         $this->deferred[] = ['part' => $part, 'depth' => $this->nestingDepth];
+    }
+
+    /** @return ParseError[] */
+    public function errors(): array
+    {
+        return $this->errors;
+    }
+
+    private function addError(string $message, int $pos): void
+    {
+        $this->errors[] = new ParseError($message, $pos);
     }
 
     /** Build a {@see Word} for an arbitrary source region (e.g. an assignment value). */
@@ -288,7 +302,7 @@ final class Lexer
      *
      * @return array{0:int,1:?array<int,Node>,2:string,3:string} [end, parts|null, value, text]
      */
-    private function scanWord(int $pos): array
+    private function scanWord(int $pos, bool $embedded = false): array
     {
         /** @var Node[] $parts */
         $parts = [];
@@ -316,6 +330,12 @@ final class Lexer
                     $hasStructure = true;
                     $litStart = $ni;
                     $i = $ni;
+                    continue;
+                }
+                // In embedded mode (e.g. an array index) whitespace and shell
+                // operators are literal; only the region bound terminates.
+                if ($embedded && $c !== -1) {
+                    $i++;
                     continue;
                 }
                 break;
@@ -360,7 +380,7 @@ final class Lexer
                 }
                 if ($nx === 34) { // $"
                     $flushLiteral($i);
-                    [$ni, $part] = $this->scanDoubleQuoted($i + 1, true);
+                    [$ni, $part] = $this->scanDoubleQuoted($i, true);
                     $parts[] = $part;
                     $hasStructure = true;
                     $litStart = $ni;
@@ -493,6 +513,8 @@ final class Lexer
         $value = $this->slice($vstart, $i);
         if ($i < $this->end) {
             $i++; // closing '
+        } else {
+            $this->addError('unterminated single quote', $start);
         }
         $text = $this->slice($start, $i);
 
@@ -505,7 +527,7 @@ final class Lexer
     private function scanDoubleQuoted(int $i, bool $locale): array
     {
         $start = $i;
-        $i++; // opening "
+        $i += $locale ? 2 : 1; // opening " (or $" for locale strings)
         /** @var Node[] $parts */
         $parts = [];
         $litStart = $i;
@@ -570,6 +592,8 @@ final class Lexer
         $flush($i);
         if ($i < $this->end) {
             $i++; // closing "
+        } else {
+            $this->addError('unterminated double quote', $start);
         }
         $text = $this->slice($start, $i);
 
@@ -592,6 +616,8 @@ final class Lexer
         $raw = $this->slice($vstart, $i);
         if ($i < $this->end) {
             $i++; // closing '
+        } else {
+            $this->addError('unterminated ANSI-C quote', $start + 1);
         }
         $text = $this->slice($start, $i);
 
@@ -600,9 +626,10 @@ final class Lexer
 
     /**
      * Consume a balanced region up to a closing char, honoring quotes/nesting.
-     * Returns the index just past the closer (or end bound if unterminated).
+     *
+     * @return array{0:int,1:bool} [index just past the closer (or end bound), whether the closer was found]
      */
-    private function matchBalanced(int $i, int $open, int $close): int
+    private function matchBalanced(int $i, int $open, int $close): array
     {
         $depth = 0;
         while ($i < $this->end) {
@@ -637,7 +664,7 @@ final class Lexer
             }
             if ($c === $close) {
                 if ($depth === 0) {
-                    return $i + 1;
+                    return [$i + 1, true];
                 }
                 $depth--;
                 $i++;
@@ -646,7 +673,7 @@ final class Lexer
             $i++;
         }
 
-        return $i;
+        return [$i, false];
     }
 
     /** @return array{0:int,1:Node} */
@@ -654,8 +681,11 @@ final class Lexer
     {
         $start = $i;
         $innerStart = $i + 2; // past "$("
-        $close = $this->matchBalanced($innerStart, 40, 41);
-        $innerEnd = $close > $innerStart ? $close - 1 : $close;
+        [$close, $found] = $this->matchBalanced($innerStart, 40, 41);
+        if (!$found) {
+            $this->addError('unterminated command substitution', $start);
+        }
+        $innerEnd = $found ? $close - 1 : $close;
         $inner = $this->slice($innerStart, $innerEnd);
         $text = $this->slice($start, $close);
         $part = new Node('CommandExpansion', [
@@ -707,8 +737,11 @@ final class Lexer
         $start = $i;
         $operator = $this->cc($i) === 60 ? '<' : '>';
         $innerStart = $i + 2; // past "<(" / ">("
-        $close = $this->matchBalanced($innerStart, 40, 41);
-        $innerEnd = $close > $innerStart ? $close - 1 : $close;
+        [$close, $found] = $this->matchBalanced($innerStart, 40, 41);
+        if (!$found) {
+            $this->addError('unterminated process substitution', $start);
+        }
+        $innerEnd = $found ? $close - 1 : $close;
         $inner = $this->slice($innerStart, $innerEnd);
         $text = $this->slice($start, $close);
         $part = new Node('ProcessSubstitution', [
@@ -796,8 +829,11 @@ final class Lexer
     {
         $start = $i;
         $innerStart = $i + 2; // past "${"
-        $close = $this->matchBalanced($innerStart, 123, 125);
-        $innerEnd = $close > $innerStart ? $close - 1 : $close;
+        [$close, $found] = $this->matchBalanced($innerStart, 123, 125);
+        if (!$found) {
+            $this->addError('unterminated parameter expansion', $start);
+        }
+        $innerEnd = $found ? $close - 1 : $close;
         $inner = $this->slice($innerStart, $innerEnd);
         $text = $this->slice($start, $close);
 
@@ -871,7 +907,7 @@ final class Lexer
                 $j++;
             }
             $props['index'] = substr($inner, $idxStart, $j - $idxStart);
-            $idxParts = $this->partsOf($props['index'], $innerStart + $idxStart);
+            $idxParts = $this->partsOf($props['index'], $innerStart + $idxStart, true);
             if ($idxParts !== null) {
                 $props['indexParts'] = $idxParts;
             }
@@ -976,23 +1012,66 @@ final class Lexer
     private function tryScanBraceExpansion(int $i): ?array
     {
         // A brace expansion contains a top-level comma or `..` range and a matching
-        // `}` with no unquoted whitespace inside.
+        // `}` with no unquoted whitespace at the top level. Quotes and expansions
+        // are opaque (their contents are skipped).
         $depth = 0;
         $j = $i + 1;
         $hasComma = false;
         $hasRange = false;
         while ($j < $this->end) {
             $c = $this->cc($j);
-            if ($this->isBlank($c) || $c === 10) {
-                return null;
-            }
             if ($c === 92) {
-                $j += 2;
+                $j += ($j + 1 < $this->end) ? 2 : 1;
+                continue;
+            }
+            if ($c === 39) { // '...'
+                $j++;
+                while ($j < $this->end && $this->cc($j) !== 39) {
+                    $j++;
+                }
+                $j++;
+                continue;
+            }
+            if ($c === 34) { // "..."
+                $j++;
+                while ($j < $this->end && $this->cc($j) !== 34) {
+                    if ($this->cc($j) === 92) {
+                        $j++;
+                    }
+                    $j++;
+                }
+                $j++;
+                continue;
+            }
+            if ($c === 96) { // `...`
+                $j++;
+                while ($j < $this->end && $this->cc($j) !== 96) {
+                    if ($this->cc($j) === 92) {
+                        $j++;
+                    }
+                    $j++;
+                }
+                $j++;
+                continue;
+            }
+            if ($c === 36 && $this->cc($j + 1) === 40) { // $(
+                [$j] = $this->matchBalanced($j + 2, 40, 41);
+                continue;
+            }
+            if ($c === 36 && $this->cc($j + 1) === 123) { // ${
+                [$j] = $this->matchBalanced($j + 2, 123, 125);
+                continue;
+            }
+            if (($c === 60 || $c === 62) && $this->cc($j + 1) === 40) { // <( >(
+                [$j] = $this->matchBalanced($j + 2, 40, 41);
                 continue;
             }
             if ($c === 123) {
                 $depth++;
-            } elseif ($c === 125) {
+                $j++;
+                continue;
+            }
+            if ($c === 125) {
                 if ($depth === 0) {
                     if (!$hasComma && !$hasRange) {
                         return null;
@@ -1004,11 +1083,20 @@ final class Lexer
                     return [$end, new Node('BraceExpansion', ['text' => $text, 'parts' => $parts])];
                 }
                 $depth--;
-            } elseif ($c === 44 && $depth === 0) {
+                $j++;
+                continue;
+            }
+            if ($c === 44 && $depth === 0) {
                 $hasComma = true;
-            } elseif ($c === 46 && $this->cc($j + 1) === 46 && $depth === 0) {
+                $j++;
+                continue;
+            }
+            if ($c === 46 && $this->cc($j + 1) === 46 && $depth === 0) {
                 $hasRange = true;
-            } elseif ($this->isMeta($c)) {
+                $j += 2;
+                continue;
+            }
+            if ($this->isBlank($c) || $c === 10 || $this->isMeta($c)) {
                 return null;
             }
             $j++;
@@ -1022,7 +1110,7 @@ final class Lexer
     {
         $operator = $this->source[$i];
         $start = $i;
-        $close = $this->matchBalanced($i + 2, 40, 41);
+        [$close] = $this->matchBalanced($i + 2, 40, 41);
         $patStart = $i + 2;
         $patEnd = $close > $patStart ? $close - 1 : $close;
         $pattern = $this->slice($patStart, $patEnd);
@@ -1042,16 +1130,19 @@ final class Lexer
      *
      * @return Node[]|null
      */
-    private function partsOf(string $region, int $absStart): ?array
+    private function partsOf(string $region, int $absStart, bool $embedded = false): ?array
     {
         if ($region === '') {
             return null;
         }
         $sub = new self($this->source, $absStart, $absStart + strlen($region));
         $sub->nestingDepth = $this->nestingDepth;
-        [, $parts] = $sub->scanWord($absStart);
+        [, $parts] = $sub->scanWord($absStart, $embedded);
         foreach ($sub->deferred as $d) {
             $this->deferred[] = $d;
+        }
+        foreach ($sub->errors as $e) {
+            $this->errors[] = $e;
         }
 
         return $parts;
@@ -1064,6 +1155,9 @@ final class Lexer
         [$end, $parts, $value] = $sub->scanWord($absStart);
         foreach ($sub->deferred as $d) {
             $this->deferred[] = $d;
+        }
+        foreach ($sub->errors as $e) {
+            $this->errors[] = $e;
         }
 
         return new Word($text, $absStart, $absStart + strlen($text), $parts, $value);
@@ -1169,31 +1263,94 @@ final class Lexer
     {
         $out = '';
         $n = strlen($s);
-        for ($i = 0; $i < $n; $i++) {
-            if ($s[$i] !== '\\' || $i + 1 >= $n) {
-                $out .= $s[$i];
+        $i = 0;
+        while ($i < $n) {
+            $c = $s[$i];
+            if ($c !== '\\') {
+                $out .= $c;
+                $i++;
                 continue;
             }
+            if ($i + 1 >= $n) {
+                $out .= '\\'; // trailing backslash is literal
+                break;
+            }
             $i++;
-            $c = $s[$i];
-            switch ($c) {
-                case 'n': $out .= "\n"; break;
-                case 't': $out .= "\t"; break;
-                case 'r': $out .= "\r"; break;
-                case 'a': $out .= "\x07"; break;
-                case 'b': $out .= "\x08"; break;
-                case 'f': $out .= "\x0C"; break;
-                case 'v': $out .= "\x0B"; break;
+            $e = $s[$i];
+            switch ($e) {
+                case 'n': $out .= "\n"; $i++; break;
+                case 't': $out .= "\t"; $i++; break;
+                case 'r': $out .= "\r"; $i++; break;
+                case 'a': $out .= "\x07"; $i++; break;
+                case 'b': $out .= "\x08"; $i++; break;
+                case 'f': $out .= "\x0C"; $i++; break;
+                case 'v': $out .= "\x0B"; $i++; break;
                 case 'e':
-                case 'E': $out .= "\x1B"; break;
-                case '\\': $out .= '\\'; break;
-                case "'": $out .= "'"; break;
-                case '"': $out .= '"'; break;
-                default: $out .= '\\' . $c; break;
+                case 'E': $out .= "\x1B"; $i++; break;
+                case '\\': $out .= '\\'; $i++; break;
+                case "'": $out .= "'"; $i++; break;
+                case '"': $out .= '"'; $i++; break;
+                case '?': $out .= '?'; $i++; break;
+                case 'x':
+                    $i++;
+                    $hex = '';
+                    while ($i < $n && strlen($hex) < 2 && ctype_xdigit($s[$i])) {
+                        $hex .= $s[$i];
+                        $i++;
+                    }
+                    $out .= $hex === '' ? '\\x' : chr(hexdec($hex) & 0xFF);
+                    break;
+                case 'u':
+                case 'U':
+                    $max = $e === 'u' ? 4 : 8;
+                    $i++;
+                    $hex = '';
+                    while ($i < $n && strlen($hex) < $max && ctype_xdigit($s[$i])) {
+                        $hex .= $s[$i];
+                        $i++;
+                    }
+                    $out .= $hex === '' ? '\\' . $e : $this->utf8((int) hexdec($hex));
+                    break;
+                case 'c':
+                    $i++;
+                    if ($i >= $n) {
+                        $out .= '\\c';
+                        break;
+                    }
+                    $x = $s[$i];
+                    $i++;
+                    $out .= $x === '?' ? "\x7F" : chr(ord($x) & 0x1F);
+                    break;
+                default:
+                    if ($e >= '0' && $e <= '7') {
+                        $oct = $e;
+                        $i++;
+                        while ($i < $n && strlen($oct) < 3 && $s[$i] >= '0' && $s[$i] <= '7') {
+                            $oct .= $s[$i];
+                            $i++;
+                        }
+                        $out .= chr(octdec($oct) & 0xFF);
+                    } else {
+                        $out .= '\\' . $e;
+                        $i++;
+                    }
+                    break;
             }
         }
 
         return $out;
+    }
+
+    private function utf8(int $cp): string
+    {
+        if (function_exists('mb_chr')) {
+            $ch = mb_chr($cp, 'UTF-8');
+            if ($ch !== false) {
+                return $ch;
+            }
+        }
+
+        return $cp < 128 ? chr($cp) : '';
     }
 
     // --- Heredoc handling -------------------------------------------------
@@ -1325,6 +1482,9 @@ final class Lexer
         $flush($end);
         foreach ($sub->deferred as $d) {
             $this->deferred[] = $d;
+        }
+        foreach ($sub->errors as $e) {
+            $this->errors[] = $e;
         }
 
         return $parts;

@@ -45,7 +45,7 @@ final class ErrorRecoveryTest extends TestCase
     {
         // The root parses fine; the substitution body carries its own error.
         $ast = parse('echo $(if true; then)');
-        $this->assertSame([], $ast->errors);
+        $this->assertNull($ast->errors);
         $part = $ast->commands[0]->command->suffix[0]->parts[0];
         $this->assertNotEmpty($part->script->errors);
     }
