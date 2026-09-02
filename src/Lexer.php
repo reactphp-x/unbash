@@ -1402,11 +1402,14 @@ final class Lexer
             }
             $bodyText = $this->slice($bodyStart, $bodyEnd);
             $parts = $h['quoted'] ? null : $this->heredocParts($bodyText, $bodyStart);
-            $value = $parts === null ? $bodyText : $this->computeValue($parts);
             $redirect = $h['redirect'];
-            $redirect->body = new Word($bodyText, $bodyStart, $bodyEnd, $parts, $value);
             $redirect->content = $bodyText;
-            $redirect->heredocQuoted = $h['quoted'];
+            $redirect->heredocQuoted = $h['quoted'] ? true : null;
+            // A body Word is present only for an unquoted heredoc that actually
+            // contains expansions; otherwise `body` is absent.
+            $redirect->body = $parts === null
+                ? null
+                : new Word($bodyText, $bodyStart, $bodyEnd, $parts, $this->computeValue($parts));
             $this->pos = $i;
             if (!$closed) {
                 $this->pos = $this->end;
@@ -1427,6 +1430,7 @@ final class Lexer
         }
         /** @var Node[] $parts */
         $parts = [];
+        $hasExpansion = false;
         $sub = new self($this->source, $absStart, $absStart + strlen($body));
         $sub->nestingDepth = $this->nestingDepth;
         $i = $absStart;
@@ -1441,6 +1445,10 @@ final class Lexer
         };
         while ($i < $end) {
             $c = $sub->cc($i);
+            if ($c === 92) { // backslash escapes the next char (e.g. \$ is literal)
+                $i += ($i + 1 < $end) ? 2 : 1;
+                continue;
+            }
             if ($c === 36) {
                 $nx = $sub->cc($i + 1);
                 if ($nx === 123) {
@@ -1490,6 +1498,13 @@ final class Lexer
             $this->errors[] = $e;
         }
 
-        return $parts;
+        foreach ($parts as $p) {
+            if ($p->type !== 'Literal') {
+                $hasExpansion = true;
+                break;
+            }
+        }
+
+        return $hasExpansion ? $parts : null;
     }
 }

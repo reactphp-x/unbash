@@ -177,7 +177,7 @@ final class ParserTest extends TestCase
     {
         $r = parse("cat <<EOF\nhello \$NAME\nEOF\n")->commands[0]->command->redirects[0];
         $this->assertSame('<<', $r->operator);
-        $this->assertFalse($r->heredocQuoted);
+        $this->assertNull($r->heredocQuoted);
         $this->assertSame("hello \$NAME\n", $r->body->value);
         $types = array_map(static fn (Node $p) => $p->type, $r->body->parts);
         $this->assertSame(['Literal', 'SimpleExpansion', 'Literal'], $types);
@@ -187,15 +187,15 @@ final class ParserTest extends TestCase
     {
         $r = parse("cat <<'EOF'\n\$x is literal\nEOF\n")->commands[0]->command->redirects[0];
         $this->assertTrue($r->heredocQuoted);
-        $this->assertNull($r->body->parts);
-        $this->assertSame("\$x is literal\n", $r->body->value);
+        $this->assertNull($r->body);
+        $this->assertSame("\$x is literal\n", $r->content);
     }
 
     public function testHeredocDashStripsTabs(): void
     {
         $r = parse("cat <<-END\n\t\tindented\n\tEND\n")->commands[0]->command->redirects[0];
         $this->assertSame('<<-', $r->operator);
-        $this->assertStringContainsString('indented', $r->body->value);
+        $this->assertStringContainsString('indented', $r->content);
     }
 
     public function testSubshell(): void
