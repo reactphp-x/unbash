@@ -30,6 +30,9 @@ final class Parser
 
     private bool $lastStmtSeparated = false;
 
+    /** @var Node[] Redirects consumed after a pipeline that belong to the statement. */
+    private array $pendingStatementRedirects = [];
+
     private const COMPOUND_KEYWORDS = [
         'if', 'for', 'while', 'until', 'case', 'select', 'function', 'coproc',
     ];
@@ -216,6 +219,16 @@ final class Parser
                 && !$this->isUnexpectedTerminator($t)) {
                 $tok = $t['type'] === 'op' ? $t['op'] : ($t['word']->text ?? '');
                 $this->error("unexpected token '$tok'", $t['pos']);
+                // A '(' glued directly to the preceding word is a malformed word
+                // (e.g. `echo *.txt(@)`), not a new subshell: skip it in recovery.
+                if ($this->isOp($t, '(') && $t['pos'] === $stmt->end) {
+                    $close = $this->matchParen($t['pos']);
+                    $this->buf = [];
+                    $this->lexer->seek($close + 1);
+                    $this->lastEnd = $close + 1;
+                    $this->skipTerminators();
+                    continue;
+                }
             }
             // Guard against non-progress on unexpected tokens.
             if ($this->peek() === $before && $before['type'] !== 'eof') {
@@ -263,13 +276,16 @@ final class Parser
         $t = $this->peek();
         $startPos = $t['pos'];
 
+        $this->pendingStatementRedirects = [];
         $command = $this->parseAndOr();
         if ($command === null) {
             return null;
         }
 
-        // Trailing redirects (applies mainly to compound commands).
-        $redirects = [];
+        // Trailing redirects on a bare compound command belong to the statement.
+        // parsePipeline already collected them (so a following `|` still pipes).
+        $redirects = $this->pendingStatementRedirects;
+        $this->pendingStatementRedirects = [];
         while ($this->isRedirectStart()) {
             $redirects[] = $this->parseRedirect();
         }
@@ -380,16 +396,32 @@ final class Parser
         $first = $this->parseCommand();
         $commands = $first !== null ? [$first] : [];
         $operators = [];
-        while ($this->isOp($this->peek(), '|', '|&')) {
-            $op = $this->advance()['op'];
-            $operators[] = $op;
-            $this->skipNewlines();
-            $next = $this->parseCommand();
-            if ($next === null) {
-                $this->error("expected command after '$op'", $this->peek()['pos']);
-                break;
+        while (true) {
+            // Trailing redirects on the current element (a simple command already
+            // consumed its own; this handles compound commands like subshells).
+            $elemRedirects = [];
+            while ($this->isRedirectStart()) {
+                $elemRedirects[] = $this->parseRedirect();
             }
-            $commands[] = $next;
+            if ($this->isOp($this->peek(), '|', '|&')) {
+                if ($elemRedirects !== [] && $commands !== []) {
+                    $last = $commands[count($commands) - 1];
+                    $last->redirects = array_merge($last->redirects ?? [], $elemRedirects);
+                }
+                $op = $this->advance()['op'];
+                $operators[] = $op;
+                $this->skipNewlines();
+                $next = $this->parseCommand();
+                if ($next === null) {
+                    $this->error("expected command after '$op'", $this->peek()['pos']);
+                    break;
+                }
+                $commands[] = $next;
+                continue;
+            }
+            // No pipe follows: these redirects belong to the enclosing statement.
+            $this->pendingStatementRedirects = $elemRedirects;
+            break;
         }
 
         if (count($commands) <= 1 && !$negated && !$time) {
@@ -486,7 +518,11 @@ final class Parser
         while ($i < $this->end) {
             $c = $src[$i];
             if ($depth === 0) {
-                if ($c === ' ' || $c === "\t" || $c === "\n" || $c === ';' || $c === '&' || $c === '|') {
+                if ($c === ' ' || $c === "\t" || $c === "\n" || $c === ';' || $c === '&') {
+                    break;
+                }
+                // `||` ends the operand (logical), but a single `|` is regex alternation.
+                if ($c === '|' && ($src[$i + 1] ?? '') === '|') {
                     break;
                 }
                 if ($c === '<' || $c === '>') {
@@ -849,7 +885,7 @@ final class Parser
         $terminator = null;
         $end = $body->end;
         $t = $this->peek();
-        if ($this->isOp($t, ';;', ';&', ';;&')) {
+        if ($this->isOp($t, ';;', ';&', ';;&', ';|')) {
             $terminator = $t['op'];
             $end = $t['end'];
             $this->advance();
@@ -897,7 +933,7 @@ final class Parser
         // identifier immediately followed by a compound command.
         $name = null;
         $t = $this->peek();
-        if ($t['type'] === 'word' && preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $t['word']->text)) {
+        if ($t['type'] === 'word') {
             $next = $this->peek(1);
             $compoundStart = ($next['type'] === 'op' && $next['op'] === '(')
                 || ($next['type'] === 'word' && in_array($this->kwText($next), ['{', '[[', 'if', 'for', 'while', 'until', 'case', 'select'], true));
@@ -1600,7 +1636,7 @@ final class Parser
      */
     private function parseCompoundListCase(array $stopWords, array $stopOps): Node
     {
-        return $this->parseCompoundList($stopWords, array_merge($stopOps, [';;', ';&', ';;&']));
+        return $this->parseCompoundList($stopWords, array_merge($stopOps, [';;', ';&', ';;&', ';|']));
     }
 
     private function resolveDeferred(): void

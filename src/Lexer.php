@@ -251,6 +251,9 @@ final class Lexer
                 if ($c1 === 38) {
                     return $mk(';&', 2);
                 }
+                if ($c1 === 124) { // ;| (zsh-style case fallthrough)
+                    return $mk(';|', 2);
+                }
 
                 return $mk(';', 1);
             case 40: // (
@@ -350,7 +353,7 @@ final class Lexer
                 }
                 // An array-assignment word: `name=(...)`, `name+=(...)`, or
                 // `name[idx]=(...)` keeps the parenthesized element list together.
-                if ($c === 40 && preg_match('/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=$/', $this->slice($pos, $i))) {
+                if ($c === 40 && preg_match('/^([A-Za-z_][A-Za-z0-9_]*)?(\[[^\]]*\])?\+?=$/', $this->slice($pos, $i))) {
                     $i = $this->matchArrayParen($i + 1);
                     continue;
                 }
@@ -650,6 +653,17 @@ final class Lexer
             $c = $this->cc($i);
             if ($c === 92) {
                 $i += ($i + 1 < $this->end) ? 2 : 1;
+                continue;
+            }
+            if ($c === 36 && $this->cc($i + 1) === 39) { // $'...' ANSI-C (\' is escaped)
+                $i += 2;
+                while ($i < $this->end && $this->cc($i) !== 39) {
+                    if ($this->cc($i) === 92) {
+                        $i++;
+                    }
+                    $i++;
+                }
+                $i++;
                 continue;
             }
             if ($c === 39) { // single quote
