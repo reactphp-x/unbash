@@ -1515,7 +1515,9 @@ final class Parser
         ]);
 
         if (($operator === '<<' || $operator === '<<-') && $target !== null) {
-            $quoted = $target->parts !== null || strpbrk($target->text, "'\"\\") !== false;
+            // A delimiter is "quoted" only when it contains quotes or backslash
+            // escapes; expansions (e.g. $var) do not make it quoted.
+            $quoted = strpbrk($target->text, "'\"\\") !== false;
             $node->heredocQuoted = $quoted ?: null;
             $this->lexer->registerHeredoc($node, $target->value, $quoted, $operator === '<<-');
         }
